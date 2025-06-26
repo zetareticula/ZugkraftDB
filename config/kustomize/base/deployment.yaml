@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: causal-consistency-controller
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: causal-consistency
+  template:
+    metadata:
+      labels:
+        app: causal-consistency
+    spec:
+      containers:
+      - name: controller
+        image: causal-consistency-shim:latest
+        args:
+        - --metrics-addr=:8080
+        env:
+        - name: PROCESS_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: REDIS_ADDR
+          value: "redis-service:6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+        ports:
+        - containerPort: 8080
+          name: metrics
