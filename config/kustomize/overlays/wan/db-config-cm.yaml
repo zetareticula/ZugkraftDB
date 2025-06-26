@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-config
+  namespace: default
+data:
+  db-config.yaml: |
+    databases:
+      - name: master1
+        host: cassandra-master1:9042
+        priority: 1
+        write: true
+        read: true
+        datacenter: earth
+        latency_ms: 0
+      - name: replica1
+        host: cassandra-replica1:9042
+        priority: 2
+        write: false
+        read: true
+        datacenter: earth
+        latency_ms: 0
+      - name: replica2
+        host: cassandra-replica2:9042
+        priority: 2
+        write: false
+        read: true
+        datacenter: mars
+        latency_ms: 750 # Simulate Earth-Mars latency
+    partitioning:
+      callback: custom
+      custom_rules:
+        - key_prefix: "post_"
+          dataset: master1
+    connection:
+      min_tries: 3
+      retry_delay_ms: 100
+    statistics:
+      enabled: true
+      interval_seconds: 60

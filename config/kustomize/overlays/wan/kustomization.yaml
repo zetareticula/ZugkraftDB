@@ -25,14 +25,33 @@ patches:
       path: /spec/template/spec/containers/0/env/-
       value:
         name: DATACENTER
-        value: "us-east"
+        value: "earth"
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value:
+        name: DEVICE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    - op: add
+      path: /spec/template/spec/volumes
+      value:
+      - name: db-config
+        configMap:
+          name: db-config
+    - op: add
+      path: /spec/template/spec/containers/0/volumeMounts
+      value:
+      - name: db-config
+        mountPath: "/etc/db-config"
+        readOnly: true
 - target:
     kind: Deployment
     name: causal-consistency-controller
   patch: |-
     - op: add
       path: /metadata/name
-      value: causal-consistency-controller-west
+      value: causal-consistency-controller-mars
     - op: replace
       path: /spec/replicas
       value: 5
@@ -51,6 +70,26 @@ patches:
       path: /spec/template/spec/containers/0/env/-
       value:
         name: DATACENTER
-        value: "us-west-1"
+        value: "mars"
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value:
+        name: DEVICE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    - op: add
+      path: /spec/template/spec/volumes
+      value:
+      - name: db-config
+        configMap:
+          name: db-config
+    - op: add
+      path: /spec/template/spec/containers/0/volumeMounts
+      value:
+      - name: db-config
+        mountPath: "/etc/db-config"
+        readOnly: true
 resources:
 - redis-service.yaml
+- db-config-cm.yaml
