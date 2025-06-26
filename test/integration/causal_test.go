@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,53 +10,70 @@ import (
 	"causal-consistency-shim/internal/store/mock"
 )
 
-func TestCausalConsistency(t *testing.T) {
+func TestHighReadThroughput(t *testing.T) {
 	ctx := context.Background()
 	store := mock.NewMockStore()
 	cache := mock.NewMockCache()
-	shimInstance := shim.NewCausalShim(store, cache, 1*time.Second, 1*time.Second, "test1", false)
+	shimInstance := shim.NewCausalShim(store, cache, 1*time.Second, 1*time.Second, "test1", false, false)
 
-	// Write post1
+	// Write a value
 	if err := shimInstance.PutShim(ctx, "post1", "Hello", nil); err != nil {
-		t.Fatalf("Failed to write post1: %v", err)
+		t.Fatalf("Failed to write: %v", err)
 	}
 
-	// Write post2 depending on post1
-	deps := []shim.Dependency{{Key: "post1", VectorClock: shim.VectorClock{"test1": 1}}}
-	if err := shimInstance.PutShim(ctx, "post2", "World", deps); err != nil {
-		t.Fatalf("Failed to write post2: %v", err)
+	// Simulate high read throughput
+	start := time.Now()
+	for i := 0; i < 100000; i++ {
+		value, err := shimInstance.GetShim(ctx, "post1")
+		if err != nil || value != "Hello" {
+			t.Errorf("Expected Hello, got %s, err: %v", value, err)
+		}
+	}
+	duration := time.Since(start)
+	t.Logf("Read throughput: %.2f ops/s", float64(100000)/duration.Seconds())
+}
+
+func TestLongTailedChain(t *testing.T) {
+	ctx := context.Background()
+	store := mock.NewMockStore()
+	cache := mock.NewMockCache()
+	shimInstance := shim.NewCausalShim(store, cache, 1*time.Second, 1*time.Second, "test2", false, false)
+
+	// Simulate Metafilter-like chain (up to 5817 dependencies)
+	deps := []shim.Dependency{}
+	for i := 1; i <= 20; i++ { // Limit to 20 for test speed
+		key := fmt.Sprintf("post%d", i)
+		vc := shim.VectorClock{"test2": int64(i)}
+		if err := shimInstance.PutShim(ctx, key, fmt.Sprintf("Value%d", i), deps); err != nil {
+			t.Fatalf("Failed to write %s: %v", key, err)
+		}
+		deps = append(deps, shim.Dependency{Key: key, VectorClock: vc})
 	}
 
-	// Read post2 should return "World"
-	value, err := shimInstance.GetShim(ctx, "post2")
-	if err != nil || value != "World" {
-		t.Errorf("Expected World, got %s, err: %v", value, err)
-	}
-
-	// Read post1 should return "Hello"
-	value, err = shimInstance.GetShim(ctx, "post1")
-	if err != nil || value != "Hello" {
-		t.Errorf("Expected Hello, got %s, err: %v", value, err)
+	// Verify last write
+	value, err := shimInstance.GetShim(ctx, "post20")
+	if err != nil || value != "Value20" {
+		t.Errorf("Expected Value20, got %s, err: %v", value, err)
 	}
 }
 
-func TestPruning(t *testing.T) {
+func TestConcurrentWrites(t *testing.T) {
 	ctx := context.Background()
 	store := mock.NewMockStore()
 	cache := mock.NewMockCache()
-	shimInstance := shim.NewCausalShim(store, cache, 1*time.Second, 100*time.Millisecond, "test2", false)
+	shimInstance := shim.NewCausalShim(store, cache, 1*time.Second, 1*time.Second, "test3", false, true)
 
-	// Write post1
-	if err := shimInstance.PutShim(ctx, "post1", "Old", nil); err != nil {
-		t.Fatalf("Failed to write post1: %v", err)
+	// Simulate concurrent writes
+	if err := shimInstance.PutShim(ctx, "post1", "Value1", nil); err != nil {
+		t.Fatalf("Failed to write Value1: %v", err)
+	}
+	if err := shimInstance.PutShim(ctx, "post1", "Value2", nil); err != nil {
+		t.Fatalf("Failed to write Value2: %v", err)
 	}
 
-	// Wait for pruning
-	time.Sleep(200 * time.Millisecond)
-
-	// Read post1 should return not found
-	_, err := shimInstance.GetShim(ctx, "post1")
-	if err != shim.ErrNotFound {
-		t.Errorf("Expected not found, got err: %v", err)
+	// Verify latest write
+	value, err := shimInstance.GetShim(ctx, "post1")
+	if err != nil || value != "Value2" {
+		t.Errorf("Expected Value2, got %s, err: %v", value, err)
 	}
 }

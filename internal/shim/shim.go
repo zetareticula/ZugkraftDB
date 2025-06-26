@@ -27,13 +27,14 @@ type Write struct {
 	Deps        []Dependency // Explicit causality dependencies
 	VectorClock VectorClock  // Vector clock for this write
 	Timestamp   time.Time
-	AccessCount int // For pruning
+	AccessCount int  // For pruning
+	Stable      bool // Indicates if write is stable across replicas
 }
 
 // CausalShim manages causal consistency atop an ECDS
 type CausalShim struct {
 	store         Store
-	localStore    map[string]Write    // Local store as a causal cut
+	localStore    map[string][]Write  // Supports multiple versions for concurrent writes
 	toCheck       map[string]struct{} // Keys to check for updates
 	mu            sync.RWMutex
 	fetchInterval time.Duration
@@ -45,13 +46,15 @@ type CausalShim struct {
 	sharedCache   Cache         // Optional shared cache (e.g., Redis)
 	pruneInterval time.Duration // Interval for pruning local store
 	metrics       *ShimMetrics  // Prometheus metrics
+	noOverwrites  bool          // ECDS supports no overwrites
 }
 
 // ShimMetrics tracks performance metrics
 type ShimMetrics struct {
-	readLatency  prometheus.Histogram
-	writeLatency prometheus.Histogram
-	throughput   prometheus.Counter
+	readLatency      prometheus.Histogram
+	writeLatency     prometheus.Histogram
+	throughput       prometheus.Counter
+	concurrentWrites prometheus.Counter
 }
 
 // NewShimMetrics initializes Prometheus metrics
@@ -60,7 +63,7 @@ func NewShimMetrics() *ShimMetrics {
 		readLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "causal_shim_read_latency_seconds",
 			Help:    "Read latency of the causal shim",
-			Buckets: prometheus.ExponentialBuckets(0.000001, 2, 20),
+			Buckets: prometheus.ExponentialBuckets(0.000001, 2, 20), // Microseconds
 		}),
 		writeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "causal_shim_write_latency_seconds",
@@ -71,16 +74,20 @@ func NewShimMetrics() *ShimMetrics {
 			Name: "causal_shim_operations_total",
 			Help: "Total number of operations processed by the shim",
 		}),
+		concurrentWrites: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "causal_shim_concurrent_writes_total",
+			Help: "Total number of concurrent writes detected",
+		}),
 	}
 }
 
 // NewCausalShim initializes the shim
-func NewCausalShim(store Store, cache Cache, fetchInterval, pruneInterval time.Duration, processID string, pessimistic bool) *CausalShim {
+func NewCausalShim(store Store, cache Cache, fetchInterval, pruneInterval time.Duration, processID string, pessimistic, noOverwrites bool) *CausalShim {
 	ctx, cancel := context.WithCancel(context.Background())
 	metrics := NewShimMetrics()
 	shim := &CausalShim{
 		store:         store,
-		localStore:    make(map[string]Write),
+		localStore:    make(map[string][]Write),
 		toCheck:       make(map[string]struct{}),
 		fetchInterval: fetchInterval,
 		ctx:           ctx,
@@ -91,8 +98,9 @@ func NewCausalShim(store Store, cache Cache, fetchInterval, pruneInterval time.D
 		sharedCache:   cache,
 		pruneInterval: pruneInterval,
 		metrics:       metrics,
+		noOverwrites:  noOverwrites,
 	}
-	prometheus.MustRegister(metrics.readLatency, metrics.writeLatency, metrics.throughput)
+	prometheus.MustRegister(metrics.readLatency, metrics.writeLatency, metrics.throughput, metrics.concurrentWrites)
 	go shim.resolveAsync()
 	if pruneInterval > 0 {
 		go shim.pruneLocalStore()
@@ -127,6 +135,7 @@ func (s *CausalShim) PutShim(ctx context.Context, key, value string, after []Dep
 		VectorClock: vc,
 		Timestamp:   time.Now(),
 		AccessCount: 0,
+		Stable:      false,
 	}
 
 	// Update local store or shared cache
@@ -135,7 +144,11 @@ func (s *CausalShim) PutShim(ctx context.Context, key, value string, after []Dep
 			return err
 		}
 	} else {
-		s.localStore[key] = write
+		if s.noOverwrites {
+			s.localStore[key] = append(s.localStore[key], write)
+		} else {
+			s.localStore[key] = []Write{write} // Overwrite previous versions
+		}
 	}
 
 	// Asynchronously persist to ECDS
@@ -168,8 +181,9 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (string, error) {
 			write = *w
 			exists = true
 		}
-	} else {
-		write, exists = s.localStore[key]
+	} else if writes, ok := s.localStore[key]; ok && len(writes) > 0 {
+		write = s.selectLatestWrite(writes)
+		exists = true
 	}
 
 	if s.pessimistic && (!exists || time.Since(write.Timestamp) > s.fetchInterval) {
@@ -186,11 +200,10 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (string, error) {
 						s.sharedCache.Put(ctx, w)
 					}
 				} else {
-					for _, w := range T {
-						s.localStore[w.Key] = w
-					}
+					s.localStore[key] = append(s.localStore[key], T...)
+					s.metrics.concurrentWrites.Add(float64(len(T) - 1))
 				}
-				write = *eval
+				write = s.selectLatestWrite(T)
 				exists = true
 			}
 		}
@@ -203,10 +216,21 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (string, error) {
 		return "", ErrNotFound
 	}
 	write.AccessCount++
-	if s.sharedCache == nil {
-		s.localStore[key] = write // Update access count
+	if s.sharedCache == nil && s.noOverwrites {
+		s.localStore[key] = append(s.localStore[key][:0], write) // Update access count
 	}
 	return write.Value, nil
+}
+
+// selectLatestWrite picks the latest write based on vector clocks
+func (s *CausalShim) selectLatestWrite(writes []Write) Write {
+	latest := writes[0]
+	for _, w := range writes[1:] {
+		if s.compareVectorClocks(w.VectorClock, latest.VectorClock) > 0 {
+			latest = w
+		}
+	}
+	return latest
 }
 
 // optimizeDependencies limits metadata for explicit causality
@@ -235,8 +259,9 @@ func (s *CausalShim) isCovered(w Write, T []Write) bool {
 				localDep = *w
 				exists = true
 			}
-		} else {
-			localDep, exists = s.localStore[dep.Key]
+		} else if writes, ok := s.localStore[dep.Key]; ok && len(writes) > 0 {
+			localDep = s.selectLatestWrite(writes)
+			exists = true
 		}
 
 		if exists && s.compareVectorClocks(localDep.VectorClock, dep.VectorClock) >= 0 {
@@ -290,9 +315,8 @@ func (s *CausalShim) resolveAsync() {
 							s.sharedCache.Put(s.ctx, w)
 						}
 					} else {
-						for _, w := range T {
-							s.localStore[w.Key] = w
-						}
+						s.localStore[key] = append(s.localStore[key], T...)
+						s.metrics.concurrentWrites.Add(float64(len(T) - 1))
 					}
 					delete(s.toCheck, key)
 				}
@@ -313,8 +337,13 @@ func (s *CausalShim) pruneLocalStore() {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			for key, write := range s.localStore {
-				if write.AccessCount == 0 && time.Since(write.Timestamp) > time.Hour {
+			for key, writes := range s.localStore {
+				newWrites := []Write{}
+				for _, write := range writes {
+					if write.AccessCount > 0 || time.Since(write.Timestamp) <= time.Hour || write.Stable {
+						newWrites = append(newWrites, write)
+						continue
+					}
 					stillNeeded := false
 					for _, other := range s.localStore {
 						for _, dep := range other.Deps {
@@ -327,10 +356,11 @@ func (s *CausalShim) pruneLocalStore() {
 							break
 						}
 					}
-					if !stillNeeded {
-						delete(s.localStore, key)
+					if stillNeeded {
+						newWrites = append(newWrites, write)
 					}
 				}
+				s.localStore[key] = newWrites
 			}
 			s.mu.Unlock()
 		}
@@ -340,10 +370,12 @@ func (s *CausalShim) pruneLocalStore() {
 // copyVectorClock creates a copy of the current vector clock
 func (s *CausalShim) copyVectorClock() VectorClock {
 	vc := make(VectorClock)
-	for _, v := range s.localStore {
-		for proc, clock := range v.VectorClock {
-			if current, exists := vc[proc]; !exists || clock > current {
-				vc[proc] = clock
+	for _, writes := range s.localStore {
+		for _, v := range writes {
+			for proc, clock := range v.VectorClock {
+				if current, exists := vc[proc]; !exists || clock > current {
+					vc[proc] = clock
+				}
 			}
 		}
 	}

@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+bases:
+- ../../base
+patches:
+- target:
+    kind: Deployment
+    name: causal-consistency-controller
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 5
+    - op: add
+      path: /spec/template/spec/affinity
+      value:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: causal-consistency
+              topologyKey: kubernetes.io/hostname
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value:
+        name: DATACENTER
+        value: "us-east"
+- target:
+    kind: Deployment
+    name: causal-consistency-controller
+  patch: |-
+    - op: add
+      path: /metadata/name
+      value: causal-consistency-controller-west
+    - op: replace
+      path: /spec/replicas
+      value: 5
+    - op: add
+      path: /spec/template/spec/affinity
+      value:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: causal-consistency
+              topologyKey: kubernetes.io/hostname
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value:
+        name: DATACENTER
+        value: "us-west-1"
+resources:
+- redis-service.yaml
