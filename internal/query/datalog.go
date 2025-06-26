@@ -3,9 +3,13 @@ package query
 import (
 	"fmt"
 	"strings"
-
-	"causal-consistency-shim/internal/shim"
+	"zugkraftdb/internal/shim"
 )
+
+// Package query provides functionality to parse and translate Datalog queries to CQL
+// and execute them against a causal consistency shim.
+// It includes structures for representing Datalog queries, clauses, and results,
+// as well as functions to parse Datalog syntax and translate it into CQL statements.
 
 // DatalogQuery represents a Datalog query
 type DatalogQuery struct {
@@ -96,4 +100,61 @@ func TranslateToCQL(dq *DatalogQuery) (string, []interface{}, error) {
 
 	cql := fmt.Sprintf("SELECT key, value FROM shim.entities WHERE %s", strings.Join(conditions, " AND "))
 	return cql, args, nil
+}
+
+// ExecuteDatalog executes a Datalog query against the causal shim
+func ExecuteDatalog(shimInstance shim.GetShim, query string) (*QueryResult, error) {
+	dq, err := ParseDatalog(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Datalog query: %w", err)
+	}
+
+	cql, args, err := TranslateToCQL(dq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to translate Datalog to CQL: %w", err)
+	}
+
+	var results []map[string]shim.TypedValue
+	for _, clause := range dq.Where {
+		entity, err := shimInstance.GetShim(context.Background(), clause.Entity)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get entity %s: %w", clause.Entity, err)
+		}
+		result := make(map[string]shim.TypedValue)
+		for attr, value := range entity.Attributes {
+			result[attr] = value
+		}
+		results = append(results, result)
+	}
+
+	return &QueryResult{Rows: results}, nil
+}
+
+// QueryDatalog executes a Datalog query and returns the results
+func QueryDatalog(shimInstance shim.GetShim, query string) (*QueryResult, error) {
+	result, err := ExecuteDatalog(shimInstance, query)
+	if err != nil {
+		return nil, fmt.Errorf("Datalog query execution failed: %w", err)
+	}
+	return result, nil
+}
+
+	if len(result.Rows) != 1 {
+		t.Errorf("Expected 1 result, got %d", len(result.Rows))
+	}
+
+	if result.Rows[0]["friend"].Value != "person2" {
+		t.Errorf("Expected friend to be person2, got %s", result.Rows[0]["friend"].Value)
+	}
+
+		
+		t.Errorf("Expected friend to be person2, got %s", result.Rows[0]["friend"].Value)
+	}
+		return
+	}
+		t.Errorf("Expected 1 result, got %d", len(result.Rows))
+		if result.Rows[0]["friend"].Value != "person2" {
+		t.Errorf("Expected friend to be person2, got %s", result.Rows[0]["friend"].Value)
+	}
+
 }

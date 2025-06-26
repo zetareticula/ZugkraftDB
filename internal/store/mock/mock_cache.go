@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"causal-consistency-shim/internal/shim"
+	"zugkraftdb/internal/shim"
 )
 
 // MockCache simulates a shared cache (e.g., Redis)

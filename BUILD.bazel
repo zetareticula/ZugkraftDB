@@ -1,0 +1,19 @@
+# BUILD.bazel
+
+# Define a simple rule for a Python binary
+py_binary(
+    name = "zugkraft",
+    srcs = ["main.py"],
+    deps = [
+        "//lib:my_library",
+    ],
+)
+# Define a Go binary rule
+go_binary(
+    name = "zugkraft_go",
+    srcs = ["main.go"],
+    deps = [
+        "//lib:my_go_library",
+    ],
+)
+

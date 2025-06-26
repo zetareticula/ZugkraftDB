@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"causal-consistency-shim/internal/shim"
+	"zugkraftdb/internal/shim"
 
 	"github.com/gocql/gocql"
 )

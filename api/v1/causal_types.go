@@ -2,6 +2,25 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// CausalConsistencyGroupVersion is the group version used to register these objects
+var CausalConsistencyGroupVersion = schema.GroupVersion{
+	Group:   "causal.zugkraftdb.io",
+	Version: "v1",
+}
+
+// SchemeBuilder is used to add go types to the GroupVersionKind scheme
+var SchemeBuilder = runtime.NewSchemeBuilder(
+	func(scheme *runtime.Scheme) error {
+		scheme.AddKnownTypes(CausalConsistencyGroupVersion,
+			&CausalConsistency{},
+			&CausalConsistencyList{},
+		)
+		metav1.AddToGroupVersion(scheme, CausalConsistencyGroupVersion)
+		return nil
+	},
 )
 
 // CausalConsistencySpec defines the desired state of CausalConsistency

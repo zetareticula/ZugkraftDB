@@ -6,10 +6,17 @@ import (
 	"log"
 	"time"
 
-	"causal-consistency-shim/internal/shim"
-	"causal-consistency-shim/internal/store/mock"
+	"zugkraftdb/internal/shim"
+	"zugkraftdb/internal/store/mock"
 )
 
+// Example usage of the CausalShim with mock store and cache
+
+// This example demonstrates how to use the CausalShim to write and read data with explicit causality,
+// and how to bypass the shim for eventual consistency writes.
+// It uses a mock store and cache for testing purposes.
+
+// Ensure you have the necessary imports
 func main() {
 	ctx := context.Background()
 	store := mock.NewMockStore()
@@ -43,3 +50,12 @@ func main() {
 
 	shimInstance.Close()
 }
+
+//	t.Fatalf("Failed to write: %v", err)
+// 	}
+//
+//
+
+// 	// Verify causal order
+// 	attrs, err := shimInstance.GetShim(ctx, "person3")
+// 	if err != nil || attrs[":person/friend"].Value != "person2" {

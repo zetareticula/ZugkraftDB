@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"causal-consistency-shim/internal/shim"
+	"zugkraftdb/internal/shim"
 
 	"github.com/redis/go-redis/v9"
 )

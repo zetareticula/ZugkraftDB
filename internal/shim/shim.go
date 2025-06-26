@@ -3,16 +3,17 @@ package shim
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
-	"causal-consistency-shim/internal/query"
-	"io/ioutil"
+	"zugkraftdb/internal/query"
 
 	"github.com/google/uuid"
+	"github.com/huggingface/distilbert-go" // Hypothetical DistilBERT Go binding
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/zeroshot-learners/predictor" // Hypothetical zero-shot learner
 	"gopkg.in/yaml.v2"
 )
 
@@ -33,7 +34,7 @@ const (
 	Response   OperationType = "response"
 )
 
-// Operation represents an event (invocation or response)
+// Operation represents an event in a Causet
 type Operation struct {
 	Key         string
 	Type        OperationType
@@ -45,16 +46,16 @@ type Operation struct {
 	DeviceID    string
 }
 
-// TypedValue represents a Mentat-inspired typed value
+// TypedValue represents a Datomic-inspired typed value
 type TypedValue struct {
-	Type  string
+	Type  string // e.g., string, ref, vector
 	Value interface{}
 }
 
-// Entity represents a Mentat-style entity with relativistic linearizability
-type Entity struct {
+// Causet represents a Causal Order Set (Poset with homology)
+type Causet struct {
 	Key         string
-	Attributes  map[string]TypedValue
+	Attributes  map[string]TypedValue // Includes vector embeddings
 	WriteID     string
 	Deps        []Dependency
 	VectorClock VectorClock
@@ -62,11 +63,85 @@ type Entity struct {
 	DeviceID    string
 	AccessCount int
 	Stable      bool
-	Operations  []Operation // Log of invocation/response events
+	Operations  []Operation
+	Homology    Homology // Simplified homology for causal structure
 }
 
-// ChangeListener defines a callback for data changes
-type ChangeListener func(ctx context.Context, entity Entity)
+// Homology represents causal structure (simplified)
+type Homology struct {
+	BettiNumbers []int // Placeholder for topological invariants
+}
+
+// LearnedCache implements a learned key-value cache
+type LearnedCache struct {
+	distilbert *distilbert.Model
+	zeroshot   *predictor.ZeroShotPredictor
+	embeddings map[string][]float32 // Key -> DistilBERT embedding
+	cache      map[string]Causet
+	mu         sync.RWMutex
+}
+
+// NewLearnedCache initializes the cache
+func NewLearnedCache() (*LearnedCache, error) {
+	db, err := distilbert.NewModel("distilbert-base-uncased")
+	if err != nil {
+		return nil, err
+	}
+	zs, err := predictor.NewZeroShotPredictor()
+	if err != nil {
+		return nil, err
+	}
+	return &LearnedCache{
+		distilbert: db,
+		zeroshot:   zs,
+		embeddings: make(map[string][]float32),
+		cache:      make(map[string]Causet),
+	}, nil
+}
+
+// Put stores a Causet with embedding
+func (lc *LearnedCache) Put(ctx context.Context, causet Causet) error {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+
+	// Generate DistilBERT embedding for key
+	embedding, err := lc.distilbert.Embed(causet.Key)
+	if err != nil {
+		return err
+	}
+	lc.embeddings[causet.Key] = embedding
+	lc.cache[causet.Key] = causet
+	return nil
+}
+
+// Get retrieves a Causet, using zero-shot prediction if missed
+func (lc *LearnedCache) Get(ctx context.Context, key string) (*Causet, error) {
+	lc.mu.RLock()
+	causet, exists := lc.cache[key]
+	lc.mu.RUnlock()
+
+	if exists {
+		return &causet, nil
+	}
+
+	// Zero-shot prediction for similar keys
+	predictedKeys, err := lc.zeroshot.PredictSimilarKeys(key)
+	if err != nil {
+		return nil, err
+	}
+
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	for _, pk := range predictedKeys {
+		if c, ok := lc.cache[pk]; ok {
+			return &c, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// ChangeListener defines a callback for Causet updates
+type ChangeListener func(ctx context.Context, causet Causet)
 
 // DatabaseConfig defines a database server
 type DatabaseConfig struct {
@@ -76,7 +151,7 @@ type DatabaseConfig struct {
 	Write      bool   `yaml:"write"`
 	Read       bool   `yaml:"read"`
 	Datacenter string `yaml:"datacenter"`
-	LatencyMs  int    `yaml:"latency_ms"` // For relativistic high-latency environments
+	LatencyMs  int    `yaml:"latency_ms"`
 }
 
 // PartitioningConfig defines partitioning rules
@@ -127,10 +202,10 @@ func LoadConfig(path string) (*Config, error) {
 // PartitionCallback defines key-to-dataset mapping
 type PartitionCallback func(key string) string
 
-// CausalShim manages relativistic linearizability
+// CausalShim manages ZugkraftDB
 type CausalShim struct {
 	store         Store
-	localStore    map[string][]Entity
+	localStore    map[string][]Causet
 	toCheck       map[string]struct{}
 	mu            sync.RWMutex
 	fetchInterval time.Duration
@@ -140,7 +215,7 @@ type CausalShim struct {
 	logicalClock  int64
 	deviceID      string
 	pessimistic   bool
-	sharedCache   Cache
+	learnedCache  *LearnedCache
 	pruneInterval time.Duration
 	metrics       *ShimMetrics
 	noOverwrites  bool
@@ -159,6 +234,7 @@ type ShimMetrics struct {
 	connectionFailures prometheus.Counter
 	schemaChanges      prometheus.Counter
 	causalViolations   prometheus.Counter
+	cacheHits          prometheus.Counter
 	datasetHits        *prometheus.CounterVec
 }
 
@@ -166,50 +242,59 @@ type ShimMetrics struct {
 func NewShimMetrics() *ShimMetrics {
 	return &ShimMetrics{
 		readLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "causal_shim_read_latency_seconds",
+			Name:    "zugkraftdb_read_latency_seconds",
 			Help:    "Read latency",
 			Buckets: prometheus.ExponentialBuckets(0.000001, 2, 20),
 		}),
 		writeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "causal_shim_write_latency_seconds",
+			Name:    "zugkraftdb_write_latency_seconds",
 			Help:    "Write latency",
 			Buckets: prometheus.ExponentialBuckets(0.000001, 2, 20),
 		}),
 		queryLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "causal_shim_query_latency_seconds",
+			Name:    "zugkraftdb_query_latency_seconds",
 			Help:    "Datalog query latency",
 			Buckets: prometheus.ExponentialBuckets(0.000001, 2, 20),
 		}),
 		throughput: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "causal_shim_operations_total",
+			Name: "zugkraftdb_operations_total",
 			Help: "Total operations",
 		}),
 		concurrentWrites: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "causal_shim_concurrent_writes_total",
+			Name: "zugkraftdb_concurrent_writes_total",
 			Help: "Concurrent writes",
 		}),
 		connectionFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "causal_shim_connection_failures_total",
+			Name: "zugkraftdb_connection_failures_total",
 			Help: "Connection failures",
 		}),
 		schemaChanges: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "causal_shim_schema_changes_total",
+			Name: "zugkraftdb_schema_changes_total",
 			Help: "Schema attribute additions",
 		}),
 		causalViolations: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "causal_shim_causal_violations_total",
+			Name: "zugkraftdb_causal_violations_total",
 			Help: "Causal order violations detected",
 		}),
+		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "zugkraftdb_cache_hits_total",
+			Help: "Learned cache hits",
+		}),
 		datasetHits: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "causal_shim_dataset_hits_total",
+			Name: "zugkraftdb_dataset_hits_total",
 			Help: "Hits per dataset",
 		}, []string{"dataset", "operation"}),
 	}
 }
 
 // NewCausalShim initializes the shim
-func NewCausalShim(store Store, cache Cache, configPath, deviceID string, fetchInterval, pruneInterval time.Duration, processID string, pessimistic, noOverwrites bool) (*CausalShim, error) {
+func NewCausalShim(store Store, configPath, deviceID string, fetchInterval, pruneInterval time.Duration, processID string, pessimistic, noOverwrites bool) (*CausalShim, error) {
 	config, err := LoadConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	learnedCache, err := NewLearnedCache()
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +303,7 @@ func NewCausalShim(store Store, cache Cache, configPath, deviceID string, fetchI
 	metrics := NewShimMetrics()
 	shim := &CausalShim{
 		store:         store,
-		localStore:    make(map[string][]Entity),
+		localStore:    make(map[string][]Causet),
 		toCheck:       make(map[string]struct{}),
 		fetchInterval: fetchInterval,
 		ctx:           ctx,
@@ -227,14 +312,20 @@ func NewCausalShim(store Store, cache Cache, configPath, deviceID string, fetchI
 		logicalClock:  0,
 		deviceID:      deviceID,
 		pessimistic:   pessimistic,
-		sharedCache:   cache,
+		learnedCache:  learnedCache,
 		pruneInterval: pruneInterval,
 		metrics:       metrics,
 		noOverwrites:  noOverwrites,
 		config:        config,
 		listeners:     []ChangeListener{},
 	}
-	prometheus.MustRegister(metrics.readLatency, metrics.writeLatency, metrics.queryLatency, metrics.throughput, metrics.concurrentWrites, metrics.connectionFailures, metrics.schemaChanges, metrics.causalViolations, metrics.datasetHits)
+	prometheus.MustRegister(metrics.readLatency, metrics.writeLatency, metrics.queryLatency, metrics.throughput, metrics.concurrentWrites, metrics.connectionFailures, metrics.schemaChanges, metrics.causalViolations, metrics.cacheHits, metrics.datasetHits)
+	
+
+	func (s *CausalShim) defaultPartitionCallback(key string) string {
+		// Implement the default partitioning logic here
+		return key // Example implementation
+	}
 
 	shim.partitionCb = shim.defaultPartitionCallback
 	if config.Partitioning.Callback == "custom" {
@@ -258,27 +349,7 @@ func (s *CausalShim) RegisterListener(listener ChangeListener) {
 	s.listeners = append(s.listeners, listener)
 }
 
-// defaultPartitionCallback maps to highest-priority write server
-func (s *CausalShim) defaultPartitionCallback(key string) string {
-	for _, db := range s.config.Databases {
-		if db.Write {
-			return db.Name
-		}
-	}
-	return s.config.Databases[0].Name
-}
-
-// customPartitionCallback applies custom rules
-func (s *CausalShim) customPartitionCallback(key string) string {
-	for _, rule := range s.config.Partitioning.CustomRules {
-		if strings.HasPrefix(key, rule.KeyPrefix) {
-			return rule.Dataset
-		}
-	}
-	return s.defaultPartitionCallback(key)
-}
-
-// PutShim implements the write path with relativistic linearizability
+// PutShim implements the write path
 func (s *CausalShim) PutShim(ctx context.Context, key string, attributes map[string]TypedValue, after []Dependency) error {
 	start := time.Now()
 	defer func() {
@@ -295,9 +366,12 @@ func (s *CausalShim) PutShim(ctx context.Context, key string, attributes map[str
 	vc[s.processID] = s.logicalClock
 
 	deps := s.optimizeDependencies(after)
-
 	writeID := uuid.New().String()
-	entity := Entity{
+
+	// Compute homology (simplified)
+	homology := Homology{BettiNumbers: []int{1}} // Placeholder
+
+	causet := Causet{
 		Key:         key,
 		Attributes:  attributes,
 		WriteID:     writeID,
@@ -311,48 +385,39 @@ func (s *CausalShim) PutShim(ctx context.Context, key string, attributes map[str
 			{Key: key, Type: Invocation, Attributes: attributes, WriteID: writeID, VectorClock: vc, Timestamp: time.Now(), DeviceID: s.deviceID},
 			{Key: key, Type: Response, Attributes: attributes, WriteID: writeID, VectorClock: vc, Timestamp: time.Now(), DeviceID: s.deviceID},
 		},
+		Homology: homology,
 	}
 
-	// Check for new attributes (schema evolution)
-	for attr := range attributes {
-		if _, exists := s.localStore[attr]; !exists {
-			s.metrics.schemaChanges.Inc()
-		}
-	}
-
-	// Relativistic linearizability: Validate causal order
-	if !s.isRelativisticallyLinearizable(entity) {
+	// Validate K-causality
+	if !s.isKCaual(causet) {
 		s.metrics.causalViolations.Inc()
-		return fmt.Errorf("causal order violation")
+		return fmt.Errorf("K-causality violation")
 	}
 
-	if s.sharedCache != nil {
-		if err := s.sharedCache.Put(ctx, entity); err != nil {
-			return err
-		}
+	if err := s.learnedCache.Put(ctx, causet); err != nil {
+		return err
+	}
+
+	if s.noOverwrites {
+		s.localStore[key] = append(s.localStore[key], causet)
 	} else {
-		if s.noOverwrites {
-			s.localStore[key] = append(s.localStore[key], entity)
-		} else {
-			s.localStore[key] = []Entity{entity}
-		}
+		s.localStore[key] = []Causet{causet}
 	}
 
 	go func() {
 		dataset := s.partitionCb(key)
-		if err := s.store.Write(ctx, entity, dataset); err != nil {
+		if err := s.store.Write(ctx, causet, dataset); err != nil {
 			s.metrics.connectionFailures.Inc()
 		}
-		// Notify listeners
 		for _, listener := range s.listeners {
-			listener(ctx, entity)
+			listener(ctx, causet)
 		}
 	}()
 
 	return nil
 }
 
-// GetShim implements the read path with relativistic linearizability
+// GetShim implements the read path
 func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedValue, error) {
 	start := time.Now()
 	defer func() {
@@ -364,22 +429,21 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedV
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var entity Entity
+	var causet Causet
 	var exists bool
 
-	// Check local store for recent writes (SRTM)
-	if entities, ok := s.localStore[key]; ok && len(entities) > 0 {
-		entity = s.selectLatestEntity(entities)
+	// Try learned cache first
+	c, err := s.learnedCache.Get(ctx, key)
+	if err == nil && c != nil {
+		causet = *c
 		exists = true
-	} else if s.sharedCache != nil {
-		e, err := s.sharedCache.Get(ctx, key)
-		if err == nil && e != nil {
-			entity = *e
-			exists = true
-		}
+		s.metrics.cacheHits.Inc()
+	} else if entities, ok := s.localStore[key]; ok && len(entities) > 0 {
+		causet = s.selectLatestCauset(entities)
+		exists = true
 	}
 
-	if s.pessimistic && (!exists || time.Since(entity.Timestamp) > s.fetchInterval) {
+	if s.pessimistic && (!exists || time.Since(causet.Timestamp) > s.fetchInterval) {
 		dataset := s.partitionCb(key)
 		eval, err := s.store.Read(ctx, key, dataset)
 		if err != nil && err != ErrNotFound {
@@ -387,17 +451,14 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedV
 			return nil, err
 		}
 		if eval != nil {
-			T := []Entity{*eval}
-			if s.isRelativisticallyLinearizable(*eval) && s.isCovered(*eval, T) {
-				if s.sharedCache != nil {
-					for _, e := range T {
-						s.sharedCache.Put(ctx, e)
-					}
-				} else {
-					s.localStore[key] = append(s.localStore[key], T...)
-					s.metrics.concurrentWrites.Add(float64(len(T) - 1))
+			T := []Causet{*eval}
+			if s.isKCaual(*eval) && s.isCovered(*eval, T) {
+				for _, e := range T {
+					s.learnedCache.Put(ctx, e)
 				}
-				entity = s.selectLatestEntity(T)
+				s.localStore[key] = append(s.localStore[key], T...)
+				s.metrics.concurrentWrites.Add(float64(len(T) - 1))
+				causet = s.selectLatestCauset(T)
 				exists = true
 			} else {
 				s.metrics.causalViolations.Inc()
@@ -410,14 +471,14 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedV
 	if !exists {
 		return nil, ErrNotFound
 	}
-	entity.AccessCount++
-	if s.sharedCache == nil && s.noOverwrites {
-		s.localStore[key] = append(s.localStore[key][:0], entity)
+	causet.AccessCount++
+	if s.noOverwrites {
+		s.localStore[key] = append(s.localStore[key][:0], causet)
 	}
-	return entity.Attributes, nil
+	return causet.Attributes, nil
 }
 
-// QueryDatalog executes a Datalog query with causal constraints
+// QueryDatalog executes a Datalog query
 func (s *CausalShim) QueryDatalog(ctx context.Context, queryStr string) (*query.QueryResult, error) {
 	start := time.Now()
 	defer func() {
@@ -435,22 +496,21 @@ func (s *CausalShim) QueryDatalog(ctx context.Context, queryStr string) (*query.
 		return nil, err
 	}
 
-	dataset := s.partitionCb("") // Default dataset for queries
+	dataset := s.partitionCb("")
 	rows, err := s.store.Query(ctx, cql, args, dataset)
 	if err != nil {
 		s.metrics.connectionFailures.Inc()
 		return nil, err
 	}
 
-	// Validate causal order for query results
 	for _, row := range rows {
-		entity := Entity{
+		causet := Causet{
 			Attributes:  row,
-			VectorClock: s.copyVectorClock(), // Simplified; in practice, fetch from store
+			VectorClock: s.copyVectorClock(),
 		}
-		if !s.isRelativisticallyLinearizable(entity) {
+		if !s.isKCaual(causet) {
 			s.metrics.causalViolations.Inc()
-			return nil, fmt.Errorf("causal order violation in query result")
+			return nil, fmt.Errorf("K-causality violation in query result")
 		}
 	}
 
@@ -458,25 +518,24 @@ func (s *CausalShim) QueryDatalog(ctx context.Context, queryStr string) (*query.
 	return result, nil
 }
 
-// isRelativisticallyLinearizable checks if an entity satisfies Definition 4
-func (s *CausalShim) isRelativisticallyLinearizable(entity Entity) bool {
-	// Check if operations form a legal sequential history respecting causal order
-	for _, op := range entity.Operations {
-		for _, dep := range entity.Deps {
+// isKCaual checks K-causality
+func (s *CausalShim) isKCaual(causet Causet) bool {
+	for _, op := range causet.Operations {
+		for _, dep := range causet.Deps {
 			if s.compareVectorClocks(op.VectorClock, dep.VectorClock) < 0 {
-				return false // Causal violation: operation precedes dependency
+				return false
 			}
 		}
 	}
 	return true
 }
 
-// selectLatestEntity picks the latest entity
-func (s *CausalShim) selectLatestEntity(entities []Entity) Entity {
-	latest := entities[0]
-	for _, e := range entities[1:] {
-		if s.compareVectorClocks(e.VectorClock, latest.VectorClock) > 0 {
-			latest = e
+// selectLatestCauset picks the latest Causet
+func (s *CausalShim) selectLatestCauset(causets []Causet) Causet {
+	latest := causets[0]
+	for _, c := range causets[1:] {
+		if s.compareVectorClocks(c.VectorClock, latest.VectorClock) > 0 {
+			latest = c
 		}
 	}
 	return latest
@@ -497,19 +556,16 @@ func (s *CausalShim) optimizeDependencies(deps []Dependency) []Dependency {
 }
 
 // isCovered checks causal cut
-func (s *CausalShim) isCovered(e Entity, T []Entity) bool {
-	for _, dep := range e.Deps {
-		var localDep Entity
+func (s *CausalShim) isCovered(c Causet, T []Causet) bool {
+	for _, dep := range c.Deps {
+		var localDep Causet
 		var exists bool
 
-		if s.sharedCache != nil {
-			e, err := s.sharedCache.Get(s.ctx, dep.Key)
-			if err == nil && e != nil {
-				localDep = *e
-				exists = true
-			}
-		} else if entities, ok := s.localStore[dep.Key]; ok && len(entities) > 0 {
-			localDep = s.selectLatestEntity(entities)
+		if c, err := s.learnedCache.Get(s.ctx, dep.Key); err == nil && c != nil {
+			localDep = *c
+			exists = true
+		} else if causets, ok := s.localStore[dep.Key]; ok && len(causets) > 0 {
+			localDep = s.selectLatestCauset(causets)
 			exists = true
 		}
 
@@ -523,13 +579,13 @@ func (s *CausalShim) isCovered(e Entity, T []Entity) bool {
 		}
 
 		dataset := s.partitionCb(dep.Key)
-		depEntity, err := s.store.ReadDependency(s.ctx, dep.Key, dep.VectorClock, dataset)
-		if err != nil || depEntity == nil {
+		depCauset, err := s.store.ReadDependency(s.ctx, dep.Key, dep.VectorClock, dataset)
+		if err != nil || depCauset == nil {
 			s.metrics.connectionFailures.Inc()
 			return false
 		}
-		T = append(T, *depEntity)
-		if !s.isCovered(*depEntity, T) {
+		T = append(T, *depCauset)
+		if !s.isCovered(*depCauset, T) {
 			return false
 		}
 	}
@@ -561,16 +617,13 @@ func (s *CausalShim) resolveAsync() {
 					continue
 				}
 				s.mu.Lock()
-				T := []Entity{*eval}
-				if s.isRelativisticallyLinearizable(*eval) && s.isCovered(*eval, T) {
-					if s.sharedCache != nil {
-						for _, e := range T {
-							s.sharedCache.Put(s.ctx, e)
-						}
-					} else {
-						s.localStore[key] = append(s.localStore[key], T...)
-						s.metrics.concurrentWrites.Add(float64(len(T) - 1))
+				T := []Causet{*eval}
+				if s.isKCaual(*eval) && s.isCovered(*eval, T) {
+					for _, e := range T {
+						s.learnedCache.Put(s.ctx, e)
 					}
+					s.localStore[key] = append(s.localStore[key], T...)
+					s.metrics.concurrentWrites.Add(float64(len(T) - 1))
 					delete(s.toCheck, key)
 				} else {
 					s.metrics.causalViolations.Inc()
@@ -581,7 +634,7 @@ func (s *CausalShim) resolveAsync() {
 	}
 }
 
-// pruneLocalStore removes outdated entities
+// pruneLocalStore removes outdated Causets
 func (s *CausalShim) pruneLocalStore() {
 	ticker := time.NewTicker(s.pruneInterval)
 	defer ticker.Stop()
@@ -592,17 +645,17 @@ func (s *CausalShim) pruneLocalStore() {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			for key, entities := range s.localStore {
-				newEntities := []Entity{}
-				for _, entity := range entities {
-					if entity.AccessCount > 0 || time.Since(entity.Timestamp) <= time.Hour || entity.Stable {
-						newEntities = append(newEntities, entity)
+			for key, causets := range s.localStore {
+				newCausets := []Causet{}
+				for _, causet := range causets {
+					if causet.AccessCount > 0 || time.Since(causet.Timestamp) <= time.Hour || causet.Stable {
+						newCausets = append(newCausets, causet)
 						continue
 					}
 					stillNeeded := false
 					for _, other := range s.localStore {
 						for _, dep := range other.Deps {
-							if dep.Key == key && s.compareVectorClocks(dep.VectorClock, entity.VectorClock) == 0 {
+							if dep.Key == key && s.compareVectorClocks(dep.VectorClock, causet.VectorClock) == 0 {
 								stillNeeded = true
 								break
 							}
@@ -612,10 +665,10 @@ func (s *CausalShim) pruneLocalStore() {
 						}
 					}
 					if stillNeeded {
-						newEntities = append(newEntities, entity)
+						newCausets = append(newCausets, causet)
 					}
 				}
-				s.localStore[key] = newEntities
+				s.localStore[key] = newCausets
 			}
 			s.mu.Unlock()
 		}
@@ -642,9 +695,9 @@ func (s *CausalShim) collectStatistics(interval time.Duration) {
 // copyVectorClock creates a copy
 func (s *CausalShim) copyVectorClock() VectorClock {
 	vc := make(VectorClock)
-	for _, entities := range s.localStore {
-		for _, e := range entities {
-			for proc, clock := range e.VectorClock {
+	for _, causets := range s.localStore {
+		for _, c := range causets {
+			for proc, clock := range c.VectorClock {
 				if current, exists := vc[proc]; !exists || clock > current {
 					vc[proc] = clock
 				}
@@ -673,16 +726,30 @@ func (s *CausalShim) compareVectorClocks(vc1, vc2 VectorClock) int {
 		}
 	}
 	if vc1Greater && vc2Greater {
-		return 0 // Concurrent
+		return 0
 	} else if vc1Greater {
 		return 1
 	} else if vc2Greater {
 		return -1
 	}
-	return 0 // Equal
+	return 0
 }
 
 // Close shuts down the shim
 func (s *CausalShim) Close() {
 	s.cancel()
 }
+
+// Close closes the store connection
+func (s *CausalShim) CloseStore() error {
+	return s.store.Close()
+}
+
+// ErrNotFound is returned when a key is not found
+var ErrNotFound = fmt.Errorf("key not found")
+// ErrCausalViolation is returned when a causal violation occurs
+var ErrCausalViolation = fmt.Errorf("causal violation detected")
+// ErrNotImplemented is returned for unimplemented features
+var ErrNotImplemented = fmt.Errorf("feature not implemented")
+// ErrInvalidConfig is returned for configuration errors
+var ErrInvalidConfig = fmt.Errorf("invalid configuration")

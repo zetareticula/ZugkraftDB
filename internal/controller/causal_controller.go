@@ -9,10 +9,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	v1 "causal-consistency-shim/api/v1"
-	shim "causal-consistency-shim/internal/shim"
-	store "causal-consistency-shim/internal/store/mock"
+	v1 "zugkraftdb/api/v1"
+	shim "zugkraftdb/internal/shim"
+	store "zugkraftdb/internal/store/mock"
 )
+
+// Package controller contains the CausalConsistencyReconciler which manages CausalConsistency resources
+// and integrates with the CausalShim for causal consistency operations.
+// It provides the reconciliation logic for CausalConsistency resources,
+// ensuring that the underlying shim is initialized and operational.
+// It also updates the status of the CausalConsistency resource based on the shim's state.
+// +kubebuilder:object:generate=true
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster,shortName=ccs
+// +kubebuilder:subresource:status
 
 // CausalConsistencyReconciler reconciles a CausalConsistency object
 type CausalConsistencyReconciler struct {

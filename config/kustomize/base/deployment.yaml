@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: causal-consistency-controller
+  name: zugkraftdb-controller
   namespace: default
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: causal-consistency
+      app: zugkraftdb
   template:
     metadata:
       labels:
-        app: causal-consistency
+        app: zugkraftdb
     spec:
       containers:
       - name: controller
-        image: causal-consistency-shim:latest
+        image: zugkraftdb:latest
         args:
         - --metrics-addr=:8080
         env:
@@ -40,3 +40,4 @@ spec:
         ports:
         - containerPort: 8080
           name: metrics
+          

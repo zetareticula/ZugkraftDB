@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"causal-consistency-shim/internal/shim"
-	"causal-consistency-shim/internal/store/mock"
+	"zugkraftdb/internal/shim"
+	"zugkraftdb/internal/shim/mock"
 )
 
 func TestRelativisticLinearizability(t *testing.T) {
