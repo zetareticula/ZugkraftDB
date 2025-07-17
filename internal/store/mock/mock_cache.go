@@ -3,37 +3,35 @@ package mock
 import (
 	"context"
 	"sync"
-
-	"zugkraftdb/internal/shim"
+	"github.com/zetareticula/zugkraftdb/internal/shim"
 )
 
 // MockCache simulates a shared cache (e.g., Redis)
 type MockCache struct {
-	data map[string]shim.Write
+	data map[string]*shim.EntityWithMetadata
 	mu   sync.RWMutex
 }
 
 // NewMockCache creates a new mock cache
 func NewMockCache() *MockCache {
 	return &MockCache{
-		data: make(map[string]shim.Write),
+		data: make(map[string]*shim.EntityWithMetadata),
 	}
 }
 
 // Get retrieves a write from the cache
-func (c *MockCache) Get(ctx context.Context, key string) (*shim.Write, error) {
+func (c *MockCache) Get(ctx context.Context, key string) (*shim.EntityWithMetadata, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	write, exists := c.data[key]
-	if !exists {
-		return nil, shim.ErrNotFound
+	if write, ok := c.data[key]; ok {
+		return write, nil
 	}
-	return &write, nil
+	return nil, shim.ErrNotFound
 }
 
 // Put stores a write in the cache
-func (c *MockCache) Put(ctx context.Context, write shim.Write) error {
+func (c *MockCache) Put(ctx context.Context, write *shim.EntityWithMetadata) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -49,3 +47,6 @@ func (c *MockCache) Delete(ctx context.Context, key string) error {
 	delete(c.data, key)
 	return nil
 }
+
+
+

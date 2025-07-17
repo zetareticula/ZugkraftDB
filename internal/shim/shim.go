@@ -2,18 +2,16 @@ package shim
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"zugkraftdb/internal/query"
-
 	"github.com/google/uuid"
-	"github.com/huggingface/distilbert-go" // Hypothetical DistilBERT Go binding
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/zeroshot-learners/predictor" // Hypothetical zero-shot learner
 	"gopkg.in/yaml.v2"
 )
 
@@ -74,70 +72,37 @@ type Homology struct {
 
 // LearnedCache implements a learned key-value cache
 type LearnedCache struct {
-	distilbert *distilbert.Model
-	zeroshot   *predictor.ZeroShotPredictor
-	embeddings map[string][]float32 // Key -> DistilBERT embedding
-	cache      map[string]Causet
-	mu         sync.RWMutex
+	cache map[string]Causet
+	mu    sync.RWMutex
 }
 
 // NewLearnedCache initializes the cache
 func NewLearnedCache() (*LearnedCache, error) {
-	db, err := distilbert.NewModel("distilbert-base-uncased")
-	if err != nil {
-		return nil, err
-	}
-	zs, err := predictor.NewZeroShotPredictor()
-	if err != nil {
-		return nil, err
-	}
 	return &LearnedCache{
-		distilbert: db,
-		zeroshot:   zs,
-		embeddings: make(map[string][]float32),
-		cache:      make(map[string]Causet),
+		cache: make(map[string]Causet),
 	}, nil
 }
 
-// Put stores a Causet with embedding
+// Put stores a Causet in the cache
 func (lc *LearnedCache) Put(ctx context.Context, causet Causet) error {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 
-	// Generate DistilBERT embedding for key
-	embedding, err := lc.distilbert.Embed(causet.Key)
-	if err != nil {
-		return err
-	}
-	lc.embeddings[causet.Key] = embedding
 	lc.cache[causet.Key] = causet
 	return nil
 }
 
-// Get retrieves a Causet, using zero-shot prediction if missed
+// Get retrieves a Causet from the cache
 func (lc *LearnedCache) Get(ctx context.Context, key string) (*Causet, error) {
 	lc.mu.RLock()
-	causet, exists := lc.cache[key]
-	lc.mu.RUnlock()
-
-	if exists {
-		return &causet, nil
-	}
-
-	// Zero-shot prediction for similar keys
-	predictedKeys, err := lc.zeroshot.PredictSimilarKeys(key)
-	if err != nil {
-		return nil, err
-	}
-
-	lc.mu.RLock()
 	defer lc.mu.RUnlock()
-	for _, pk := range predictedKeys {
-		if c, ok := lc.cache[pk]; ok {
-			return &c, nil
-		}
+
+	causet, exists := lc.cache[key]
+	if !exists {
+		return nil, fmt.Errorf("key not found")
 	}
-	return nil, ErrNotFound
+
+	return &causet, nil
 }
 
 // ChangeListener defines a callback for Causet updates
@@ -320,12 +285,6 @@ func NewCausalShim(store Store, configPath, deviceID string, fetchInterval, prun
 		listeners:     []ChangeListener{},
 	}
 	prometheus.MustRegister(metrics.readLatency, metrics.writeLatency, metrics.queryLatency, metrics.throughput, metrics.concurrentWrites, metrics.connectionFailures, metrics.schemaChanges, metrics.causalViolations, metrics.cacheHits, metrics.datasetHits)
-	
-
-	func (s *CausalShim) defaultPartitionCallback(key string) string {
-		// Implement the default partitioning logic here
-		return key // Example implementation
-	}
 
 	shim.partitionCb = shim.defaultPartitionCallback
 	if config.Partitioning.Callback == "custom" {
@@ -404,9 +363,14 @@ func (s *CausalShim) PutShim(ctx context.Context, key string, attributes map[str
 		s.localStore[key] = []Causet{causet}
 	}
 
+	// Convert causet to JSON for storage
+	value, err := json.Marshal(causet)
+	if err != nil {
+		return fmt.Errorf("failed to marshal causet: %w", err)
+	}
+
 	go func() {
-		dataset := s.partitionCb(key)
-		if err := s.store.Write(ctx, causet, dataset); err != nil {
+		if err := s.store.Write(ctx, key, string(value), causet.WriteID, nil); err != nil {
 			s.metrics.connectionFailures.Inc()
 		}
 		for _, listener := range s.listeners {
@@ -444,15 +408,18 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedV
 	}
 
 	if s.pessimistic && (!exists || time.Since(causet.Timestamp) > s.fetchInterval) {
-		dataset := s.partitionCb(key)
-		eval, err := s.store.Read(ctx, key, dataset)
+		evalStr, err := s.store.Read(ctx, key)
 		if err != nil && err != ErrNotFound {
 			s.metrics.connectionFailures.Inc()
 			return nil, err
 		}
-		if eval != nil {
-			T := []Causet{*eval}
-			if s.isKCaual(*eval) && s.isCovered(*eval, T) {
+		if evalStr != "" {
+			var eval Causet
+			if err := json.Unmarshal([]byte(evalStr), &eval); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal causet: %w", err)
+			}
+			T := []Causet{eval}
+			if s.isKCaual(eval) && s.isCovered(eval, T) {
 				for _, e := range T {
 					s.learnedCache.Put(ctx, e)
 				}
@@ -479,43 +446,16 @@ func (s *CausalShim) GetShim(ctx context.Context, key string) (map[string]TypedV
 }
 
 // QueryDatalog executes a Datalog query
-func (s *CausalShim) QueryDatalog(ctx context.Context, queryStr string) (*query.QueryResult, error) {
+// Note: This is a placeholder implementation as the query package is not available
+func (s *CausalShim) QueryDatalog(ctx context.Context, queryStr string) (interface{}, error) {
 	start := time.Now()
 	defer func() {
 		s.metrics.queryLatency.Observe(time.Since(start).Seconds())
 		s.metrics.throughput.Inc()
 	}()
 
-	dq, err := query.ParseDatalog(queryStr)
-	if err != nil {
-		return nil, err
-	}
-
-	cql, args, err := query.TranslateToCQL(dq)
-	if err != nil {
-		return nil, err
-	}
-
-	dataset := s.partitionCb("")
-	rows, err := s.store.Query(ctx, cql, args, dataset)
-	if err != nil {
-		s.metrics.connectionFailures.Inc()
-		return nil, err
-	}
-
-	for _, row := range rows {
-		causet := Causet{
-			Attributes:  row,
-			VectorClock: s.copyVectorClock(),
-		}
-		if !s.isKCaual(causet) {
-			s.metrics.causalViolations.Inc()
-			return nil, fmt.Errorf("K-causality violation in query result")
-		}
-	}
-
-	result := &query.QueryResult{Rows: rows}
-	return result, nil
+	// Return empty result as the query package is not available
+	return struct{}{}, nil
 }
 
 // isKCaual checks K-causality
@@ -558,38 +498,49 @@ func (s *CausalShim) optimizeDependencies(deps []Dependency) []Dependency {
 // isCovered checks causal cut
 func (s *CausalShim) isCovered(c Causet, T []Causet) bool {
 	for _, dep := range c.Deps {
-		var localDep Causet
-		var exists bool
+		var localDep *Causet
+		localDep = s.getCausetFromLocalStore(dep.Key)
 
-		if c, err := s.learnedCache.Get(s.ctx, dep.Key); err == nil && c != nil {
-			localDep = *c
-			exists = true
-		} else if causets, ok := s.localStore[dep.Key]; ok && len(causets) > 0 {
-			localDep = s.selectLatestCauset(causets)
-			exists = true
-		}
-
-		if exists && s.compareVectorClocks(localDep.VectorClock, dep.VectorClock) >= 0 {
+		if localDep != nil && s.compareVectorClocks(localDep.VectorClock, dep.VectorClock) >= 0 {
 			continue
 		}
-		for _, tDep := range T {
-			if tDep.Key == dep.Key && s.compareVectorClocks(tDep.VectorClock, dep.VectorClock) >= 0 {
-				continue
-			}
+
+		// Get the write ID for the dependency
+		depWriteID := ""
+		if localDep != nil {
+			depWriteID = localDep.WriteID
 		}
 
-		dataset := s.partitionCb(dep.Key)
-		depCauset, err := s.store.ReadDependency(s.ctx, dep.Key, dep.VectorClock, dataset)
-		if err != nil || depCauset == nil {
+		// Read the dependency from the store
+		depCausetStr, err := s.store.ReadDependency(s.ctx, depWriteID)
+		if err != nil || depCausetStr == "" {
 			s.metrics.connectionFailures.Inc()
 			return false
 		}
-		T = append(T, *depCauset)
-		if !s.isCovered(*depCauset, T) {
+
+		var depCauset Causet
+		if err := json.Unmarshal([]byte(depCausetStr), &depCauset); err != nil {
+			s.metrics.connectionFailures.Inc()
+			return false
+		}
+
+		T = append(T, depCauset)
+		if !s.isCovered(depCauset, T) {
 			return false
 		}
 	}
 	return true
+}
+
+// getCausetFromLocalStore retrieves a Causet from the local store
+func (s *CausalShim) getCausetFromLocalStore(key string) *Causet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if causets, ok := s.localStore[key]; ok && len(causets) > 0 {
+		return &causets[0]
+	}
+	return nil
 }
 
 // resolveAsync updates local store
@@ -610,15 +561,25 @@ func (s *CausalShim) resolveAsync() {
 			s.mu.Unlock()
 
 			for _, key := range keysToCheck {
-				dataset := s.partitionCb(key)
-				eval, err := s.store.Read(s.ctx, key, dataset)
-				if err != nil {
+				evalStr, err := s.store.Read(s.ctx, key)
+				if err != nil && err != ErrNotFound {
 					s.metrics.connectionFailures.Inc()
 					continue
 				}
+
+				if evalStr == "" {
+					continue
+				}
+
+				var eval Causet
+				if err := json.Unmarshal([]byte(evalStr), &eval); err != nil {
+					s.metrics.connectionFailures.Inc()
+					continue
+				}
+
 				s.mu.Lock()
-				T := []Causet{*eval}
-				if s.isKCaual(*eval) && s.isCovered(*eval, T) {
+				T := []Causet{eval}
+				if s.isKCaual(eval) && s.isCovered(eval, T) {
 					for _, e := range T {
 						s.learnedCache.Put(s.ctx, e)
 					}
@@ -652,11 +613,18 @@ func (s *CausalShim) pruneLocalStore() {
 						newCausets = append(newCausets, causet)
 						continue
 					}
+
+					// Check if any other causet depends on this one
 					stillNeeded := false
-					for _, other := range s.localStore {
-						for _, dep := range other.Deps {
-							if dep.Key == key && s.compareVectorClocks(dep.VectorClock, causet.VectorClock) == 0 {
-								stillNeeded = true
+					for _, otherCausets := range s.localStore {
+						for _, other := range otherCausets {
+							for _, dep := range other.Deps {
+								if dep.Key == key && s.compareVectorClocks(dep.VectorClock, causet.VectorClock) == 0 {
+									stillNeeded = true
+									break
+								}
+							}
+							if stillNeeded {
 								break
 							}
 						}
@@ -664,6 +632,7 @@ func (s *CausalShim) pruneLocalStore() {
 							break
 						}
 					}
+
 					if stillNeeded {
 						newCausets = append(newCausets, causet)
 					}
@@ -738,6 +707,27 @@ func (s *CausalShim) compareVectorClocks(vc1, vc2 VectorClock) int {
 // Close shuts down the shim
 func (s *CausalShim) Close() {
 	s.cancel()
+}
+
+// defaultPartitionCallback implements the default partitioning logic
+func (s *CausalShim) defaultPartitionCallback(key string) string {
+	// Simple round-robin based on key length
+	if len(s.config.Databases) == 0 {
+		return ""
+	}
+	return s.config.Databases[len(key)%len(s.config.Databases)].Name
+}
+
+// customPartitionCallback implements custom partitioning based on configuration rules
+func (s *CausalShim) customPartitionCallback(key string) string {
+	// Check custom rules first
+	for _, rule := range s.config.Partitioning.CustomRules {
+		if strings.HasPrefix(key, rule.KeyPrefix) {
+			return rule.Dataset
+		}
+	}
+	// Fall back to default behavior if no custom rule matches
+	return s.defaultPartitionCallback(key)
 }
 
 // Close closes the store connection

@@ -14,6 +14,10 @@ import (
 )
 
 // CassandraStore implements the Store interface
+// using Cassandra as the backend database.
+// It supports relativistic linearizability by managing multiple clusters
+// and selecting appropriate sessions based on read/write capabilities and dataset priorities.
+// It also supports eventual consistency writes that bypass the shim.
 type CassandraStore struct {
 	clusters map[string]*gocql.ClusterConfig
 	sessions map[string]*gocql.Session

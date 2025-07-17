@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
-	"zugkraftdb/internal/shim"
-	"zugkraftdb/internal/store/mock"
+	"github.com/zetareticula/zugkraftdb/internal/shim"
+	"github.com/zetareticula/zugkraftdb/internal/store/mock"
 )
 
 // Example usage of the CausalShim with mock store and cache
@@ -19,36 +21,76 @@ import (
 // Ensure you have the necessary imports
 func main() {
 	ctx := context.Background()
-	store := mock.NewMockStore()
-	cache := mock.NewMockCache()
-	shimInstance := shim.NewCausalShim(store, cache, 5*time.Second, 1*time.Hour, "client1", false)
+	store := mock.NewMockStore("test-dataset")
 
-	// Write with explicit causality
-	deps := []shim.Dependency{
-		{Key: "post1", VectorClock: shim.VectorClock{"client2": 1}},
+	// Create a temporary config file
+	configContent := `databases:
+  - name: local
+    host: localhost:6379
+    priority: 1
+    write: true
+    read: true
+    datacenter: local
+    latency_ms: 1
+`
+	configPath := "config.yaml"
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		log.Fatalf("Failed to create config file: %v", err)
 	}
-	if err := shimInstance.PutShim(ctx, "post2", "Hello, World!", deps); err != nil {
+	defer os.Remove(configPath)
+
+	// Create a simple write operation
+	writeID, err := store.GetWriteID(ctx)
+	if err != nil {
+		log.Fatalf("Failed to get write ID: %v", err)
+	}
+
+	// Prepare attributes
+	attrs := map[string]shim.TypedValue{
+		"content": {
+			Type:  "string",
+			Value: "Hello, World!",
+		},
+	}
+
+	// Convert attributes to JSON
+	attrsJSON, err := json.Marshal(attrs)
+	if err != nil {
+		log.Fatalf("Failed to marshal attributes: %v", err)
+	}
+
+	// Write data
+	err = store.Write(ctx, "post1", string(attrsJSON), writeID, nil)
+	if err != nil {
 		log.Fatalf("Failed to write: %v", err)
 	}
 
-	// Read with causal consistency
-	value, err := shimInstance.GetShim(ctx, "post2")
+	// Read data
+	value, err := store.Read(ctx, "post1")
 	if err != nil {
 		log.Fatalf("Failed to read: %v", err)
 	}
-	fmt.Printf("Read value: %s\n", value)
 
-	// Eventual consistency bypass
-	if err := store.Write(ctx, shim.Write{Key: "post3", Value: "Bypass shim"}); err != nil {
-		log.Fatalf("Failed to bypass write: %v", err)
+	// Unmarshal the attributes
+	var result map[string]shim.TypedValue
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		log.Fatalf("Failed to unmarshal result: %v", err)
 	}
-	value, err = store.Read(ctx, "post3")
+
+	fmt.Printf("Read value: %+v\n", result)
+
+	// Read using the write ID
+	depValue, err := store.ReadDependency(ctx, writeID)
 	if err != nil {
-		log.Fatalf("Failed to bypass read: %v", err)
+		log.Fatalf("Failed to read dependency: %v", err)
 	}
-	fmt.Printf("Bypass read value: %s\n", value)
+	fmt.Printf("Read by write ID: %s\n", depValue)
 
-	shimInstance.Close()
+	shimInstance, err := shim.NewCausalShim(store, configPath, "client1", 5*time.Second, 1*time.Hour, "client1", false, false)
+	if err != nil {
+		log.Fatalf("Failed to create CausalShim: %v", err)
+	}
+	defer shimInstance.Close()
 }
 
 //	t.Fatalf("Failed to write: %v", err)

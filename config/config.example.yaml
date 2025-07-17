@@ -1,0 +1,24 @@
+# Database Configuration
+databases:
+  - name: local
+    host: localhost:6379
+    priority: 1
+    write: true
+    read: true
+    datacenter: local
+    latency_ms: 1
+
+# Partitioning Configuration
+partitioning:
+  callback: ""
+  custom_rules: []
+
+# Connection Settings
+connection:
+  min_tries: 3
+  retry_delay_ms: 100
+
+# Statistics and Monitoring
+statistics:
+  enabled: true
+  interval_seconds: 60
